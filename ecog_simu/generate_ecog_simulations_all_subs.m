@@ -9,7 +9,6 @@ sub_id = [2:4 6:15 17:19];
 vals = [1:length(sub_id)];
 arr = repmat(vals , [20 1]); %20 mc iteration for each subject
 addpath(sprintf(strcat(meg_path,'/%s', '/matlab'),  subs{arr(sub)}))
-addpath(genpath('/m/nbe/scratch/braintrack/ecog'))
 addpath(genpath('/models_for_estim'))
 addpath(genpath(fullfile(pwd, '..', 'misc')));
 addpath(genpath(fullfile(pwd, '..', 'joint_est')));
