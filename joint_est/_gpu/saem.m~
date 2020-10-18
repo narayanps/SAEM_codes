@@ -1,0 +1,428 @@
+function [res, r_pf, q_ks,q_kf_hat, A_hist, V_q_hist,XI_hist]= saem_gpu(init, model, opt_params, Y_avg, Y, roi_flag, gpu_flag)
+% INPUTS
+% 1) init : struct containing initial values for parameters and kalman
+% mean/cov . init.A0, init.V_q0, init.q0, init.P0
+
+% 2) model : struct containing model params
+% model.G : lead-field matrix
+
+%model.XI : measurement noise covariance matrix
+
+%model.V_r : jitter matrix for particles
+
+%model.mesh : mesh details (mesh.p, mesh.e)
+
+%model.incl_vert : list of vertices included in source space. Its dimension
+%should be the same as the no. of columns in lead field
+
+
+
+%model.anat_parc : anatomical parcels (this will be optional in future.
+%Presently this info is used to initialize the particles in different
+%anatomical areas
+
+% 3) Y : MEG data (channels X T)
+
+% 4)  opt_params : struct containing parameters the algorithm depends on
+%opt_params.num_sources : no of sources / dipoles
+%opt_params.p : MVAR model order
+%opt_params.N : number of particles
+%opt_params.num_iter : no of iterations
+%opt_params.gamma : forgetting factor for SAEM
+%opt_params.dist_thr : distance threshold (just to make sure initial particles
+%draw are not too close to each other. This can be some value like 2 or 3
+
+
+%%%%%%%%%%%%%%PULL OUT VALUES FROM STRUCTS%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%init
+A = init.A0;
+V_q = init.V_q0;
+XI = init.XI0;
+P0 = init.P0;
+q0 = init.q0;
+
+%model
+G = model.G;
+V_r = model.V_r;
+mesh = model.mesh;
+incl_vert = model.incl_verts;
+
+
+
+%params
+num_sources = opt_params.num_sources;
+num_iter = opt_params.num_iter;
+N = opt_params.N;
+gamma = opt_params.gamma;
+dist_thr = opt_params.dist_thr;
+p = opt_params.p;
+
+
+
+
+% set few constants
+nq = num_sources*p;
+ny = size(Y,1);
+T = size(Y,2);
+Jt=size(Y,3); %no of trials
+nr=num_sources*3;
+S3 = zeros(3*nq+ny, 3*nq+ny);
+pnts = mesh.p(incl_vert, :); %xyz of vertices included in source-space
+CONST = -ny * 0.5 * log(2*pi);
+log_det = 2*sum(log(diag(chol(V_r))));
+
+% measurement noise cov for y_avg
+XI_avg = XI * (((Jt*T) - 1)/((Jt*Jt*T) - Jt^2));
+
+
+
+% histories
+A_hist = zeros(num_sources*p, num_sources*p, num_iter);
+V_q_hist = zeros(num_sources*p, num_sources*p, num_iter);
+XI_hist = zeros(ny, ny, num_iter);
+A_hist(:,:,1) = A;
+V_q_hist(:,:,1) = V_q;
+XI_hist(:,:,1) = XI;
+
+%som variables for gpu
+if gpu_flag ==1
+    look_up = zeros(Jt, N);
+    for j=1:Jt
+        look_up(j,:) = (j-1)*N+1 : N*j;
+    end
+    Y_ = zeros(ny, N, Jt);
+end
+
+
+
+
+%%%%%%%%%%%%%%%%%%SET CONDITIONAL TRAJECTORY%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+if roi_flag==1
+    anat_parc = model.anat_parc;
+    n_rois = length(anat_parc.parcels);
+    [ind_prime, r_prime, G_prime] =  set_part_traj...
+        (pnts, G,anat_parc.parcels, dist_thr, num_sources, n_rois, T);
+else
+    [ind_prime, r_prime, G_prime] =  set_part_traj_noroi...
+        (pnts, G, dist_thr, num_sources, T);
+
+end
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+for k=1:1:num_iter
+    
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%E(S) - STEP%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    %%%%%%%%%%%%%%%%%%%%%%%%%%RUN RB-PMCMC SMOOTHER%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    sprintf('iteration no %d', k)
+    tic
+    % Pre-allocate
+    q_kf = zeros(nq,T,N,Jt);
+    q_kp = zeros(nq,T,N,Jt);
+    P_kf = zeros(nq,nq,T,N);
+    P_kp = zeros(nq,nq,T,N);
+    w = zeros(N,T);
+    r_pf = zeros(nr,T,N);
+    ind_pf = zeros(num_sources, T, N);
+    G_pf=zeros(ny,num_sources,T,N);
+    log_weights = zeros(N,T);
+    r_pf(:,:,end) = r_prime;
+    G_pf(:,:,:,end) = G_prime;
+    ind_pf(:,:,end) = ind_prime;
+    q_kp(:,1,:,:) = repmat(q0,[1,1,N, Jt]);
+    P_kp(:,:,1,:) = repmat(P0,[1,1,1, N]);
+    w(:,1) = ones(size(w(:,1)));
+    w(:,1) = w(:,1)./sum(w(:,1));
+    omega_tr = zeros(nq, nq, T, Jt);
+    lambda_tr = zeros(nq, T, Jt);
+    LL = zeros(num_iter,1);
+    LL_complete = zeros(num_iter,1);
+    
+    
+    % Compute lambda, omega for conditional trajectory
+    
+    for j=1:1:Jt
+        [omega_tr(:,:,:,j), lambda_tr(:,:,j)] = compute_omega_lambda...
+            (A, V_q, G_pf, squeeze(Yw(:,:,j)), XI, num_sources, p, N, T);
+    end
+    omega_avg=squeeze(mean(omega_tr,4));
+    lambda_avg=squeeze(mean(lambda_tr,3));
+    
+    % draw particles for t=1
+    if roi_flag==1
+        for j=1:1:N-1
+            [ind_, r_, G_] =  set_part_traj...
+                (pnts, G,anat_parc.parcels, dist_thr, num_sources, n_rois, 1);
+            ind_pf(:,1,j) = ind_;
+            r_pf(:,1,j) = r_;
+            G_pf(:,:,1,j) = G_;
+        end
+    else
+        for j=1:1:N-1
+            [ind_, r_, G_] =  set_part_traj_noroi...
+                (pnts, G, dist_thr, num_sources,  1);
+            ind_pf(:,1,j) = ind_;
+            r_pf(:,1,j) = r_;
+            G_pf(:,:,1,j) = G_;
+        end
+    end
+    
+    %   LL=0;
+    for t=1:T
+        if t >=2
+            [a,~] = find(mnrnd(1,repmat(w(:,t-1)',N-1,1))');
+            ind_pf(:,t,1:end-1) = jitter_loc_v2(squeeze(r_pf(:,t-1,a)), V_r, pnts);
+            
+            for i=1:1:num_sources
+                r_pf(3*(i-1)+1:3*i,t,1:end-1) = pnts(ind_pf(i,t,1:end-1),:)';
+            end
+            
+            for i=1:1:N-1
+                G_pf(:,:,t,i) = G(:,squeeze(ind_pf(:,t,i)));
+            end
+            
+            q_kf_mean = squeeze(mean(q_kf(:,t-1,:,:),4));
+            P_kf_mean = squeeze(P_kf(:,:,t-1,:));
+            [aN] = compute_aN_fast(r_pf(:,t,:), r_pf(:,t-1,:),  q_kf_mean,  P_kf_mean, V_r, omega_avg(:,:,t-1), lambda_avg(:,t-1),...
+                num_sources, w(:,t-1), p, N,  CONST, log_det);
+            an_hist = [a;aN];
+            r_pf(:,1:t-1,:) = r_pf(:,1:t-1,an_hist);
+            q_kp(:,1:t-1,:,:) = q_kp(:,1:t-1,an_hist,:);
+            P_kp(:,:,1:t-1,:) = P_kp(:,:,1:t-1,an_hist);
+            q_kf(:,1:t-1,:,:) = q_kf(:,1:t-1,an_hist,:);
+            P_kf(:,:,1:t-1,:) = P_kf(:,:,1:t-1,an_hist);
+            G_pf(:,:,1:t-1,:) = G_pf(:,:,1:t-1,an_hist);
+            ind_pf(:,1:t-1,:) = ind_pf(:,1:t-1,an_hist);
+  
+        end
+        
+        if gpu_flag == 1 % perform kalman predict, update and log-likelihood computation on GPU
+            Y_rep = zeros(ny,N,Jt);
+            G_tilde = [squeeze(G_pf(:,:,t,:)) repmat(zeros(ny, num_sources, N), 1, p-1)];
+            for j=1:Jt
+            Y_rep(:,:,j) = repmat(squeeze(Y(:,t,j)), [1, 1, N]);
+            end
+            Y_reshape = reshape(Y_rep, ny, N*Jt);
+            %kalman predict gpu        
+            if t >= 2
+                q_kf_ = reshape(squeeze(q_kf (:,t-1,:,:)), nq, N*Jt);
+                [q_kp_, P_kp(:,:,t,:)] = gpu_kalman_predict_gpu(q_kf_, squeeze(P_kf(:,:,t-1,:)), A, V_q);
+                q_kp (:,t,:,:) = reshape(q_kp_, nq, N, Jt);
+
+            end
+        
+        % kalman update gpu
+            q_kp_ = reshape(squeeze(q_kp(:,t,:,:)), nq, N*Jt);
+            q_kp_gpu = gpuArray(q_kp_);
+            P_kp_gpu = gpuArray(squeeze(P_kp(:,:,t,:)));
+            Y_gpu = gpuArray(Y_reshape);
+            G_ = repmat(G_tilde, [1 1 1 Jt]);
+            G_=reshape(G_, ny,nq,N*Jt);
+            G_tilde_gpu = gpuArray(G_tilde);
+            G_gpu = gpuArray(G_);
+            XI_gpu = gpuArray(XI);
+            [q_kf_, P_kf(:,:,t,:), Kf_] = gpu_kalman_update(q_kp_gpu, P_kp_gpu, Y_gpu, G_tilde_gpu, G_gpu, XI_gpu, N, Jt);
+            q_kf(:,t,:,:) = reshape(q_kf_, nq, N, Jt);
+        
+            ypred = zeros(nq,N);
+            sigma = zeros(nq, nq, N);
+            log_det_sigma = zeros(1,N);
+        for i=1:N
+            tmp_G = squeeze(G_tilde(:,:,i));
+            ypred(:,i) = tmp_G*mean(q_kp_(:, look_up(:,i)),2);
+            sigma(:,:,i) = tmp_G*squeeze(P_kp (:,:,t,i))*tmp_G' + XI_avg;
+            log_det_sigma(i) = 2*sum(log(diag(chol(squeeze(sigma(:,:,i))))));
+        end
+        log_weights = gpu_logpdf();
+        else
+            ypred = zeros(nq,N);
+            sigma = zeros(nq, nq, N);
+            for i = 1:N
+                for j=1:1:Jt
+                    % Prediction
+                    if t >= 2
+                        [q_kp(:,t,i,j), P_kp(:,:,t,i)] = kalman_predict(q_kf(:,t-1,i,j), P_kf(:,:,t-1,i), A, V_q );
+                    end
+                    
+                    % Update
+                    tmp_ = [G_pf(:,:,t,i) repmat(zeros(size(G_pf(:,:,t,i))), 1, p-1)];
+                    [q_kf(:,t,i,j), P_kf(:,:,t,i), Kf(:,:,i)] = kalman_update(q_kp(:,t,i,j), P_kp(:,:,t,i), squeeze(Y(:,t,j)), tmp_, XI);
+                end
+                
+                % log-likelihood
+                ypred(:,i) = tmp_*q_kp(:,t,i);
+                sigma(:,:,i) = tmp_*P_kp(:,:,t,i)*tmp_' + XI_avg;
+                log_weights(i,t)=logpdf(Y(:,t), ypred(:,i), sigma(:,:,i));
+            end
+        end
+               
+        % PF weight update
+        maxlog = max(log_weights(:,t));
+        log_weights(:,t) = log_weights(:,t) - maxlog;
+        w(:,t) = exp(log_weights(:,t));
+        w(:,t) = w(:,t) / sum(w(:,t));
+        LL_kp = LL_kp + logpdf(Y(:,t), mean(ypred,2), mean(sigma,3));
+    end
+    LL(k,1) = LL_kp;
+    
+
+    
+    if gpu_flag==1
+        q_ks = zeros(nq,T+1,N*Jt); P_ks = zeros(nq,nq,T+1,N);
+        M = zeros(nq,nq,T,N);
+        
+        q_kp = reshape(q_kp, nq, T, N*Jt);
+        q_kf = reshape(q_kf, nq, T, N*Jt);
+        
+        P_ks(:,:,end,:) = squeeze(P_kp(:,:,end,:)); P_ks(:,:,end-1,:) = squeeze(P_kf(:,:,end,:));
+        q_ks(:,end,:) = squeeze(q_kp(:,end,:)); q_ks(:,end-1,:) = squeeze(q_kf(:,end,:));
+        
+        P_ks_t1 = squeeze(P_ks(:,:,end-1,:));
+        
+        q_ks_t1 = squeeze( q_ks(:,end-1,:));
+        
+        
+        
+        for t = T-1:-1:1
+            P_kf_t = squeeze(P_kf(:,:,t,:));
+            P_kp_t1 = squeeze(P_kp(:,:,t+1,:));
+            q_kf_t = squeeze(q_kf(:,t,:));
+            q_kp_t1 = squeeze(q_kp(:,t+1,:));
+            [J(:,:,t,:), q_ks(:,t,:), P_ks(:,:,t,:)] ...
+                = gpu_kalman_smoother(P_kf_t, P_kp_t1, q_kf_t,q_kp_t1, ...
+                q_ks_t1, P_ks_t1, A, N, Jt);
+            P_ks_t1 = squeeze(P_ks(:,:,t,:));
+            q_ks_t1 = squeeze( q_ks(:,t,:));
+        end
+        
+        
+        
+        % Computing of P_{t-1,t|T}
+        G_T = [G_pf(:,:,T,:) repmat(zeros(size(G_pf(:,:,T,:))), 1, p-1)];
+        G_T=squeeze(G_T);
+        I=eye(nq);
+        M(:,:,end,:) = init_M_gpu(I, squeeze(Kf_(:,:,:)), G_T, squeeze(P_kf(:,:,T-1,:)), A);
+        for t=T-1:-1:2
+            P_kf_t = squeeze(P_kf(:,:,t,:));
+            M_tp1 = squeeze(M(:,:,t+1,:));
+            J_tm1 = squeeze(J(:,:,t-1,:));
+            J_t = squeeze(J(:,:,t,:));
+            M(:,:,t,:)  = gpu_one_lag(A, P_kf_t, J_tm1, M_tp1, J_t);
+        end
+        q_ks = reshape(q_ks,  nq, T+1, N, Jt);
+    else
+        q_ks = zeros(nq,T+1,N,Jt); P_ks = zeros(nq,nq,T+1,N,Jt);
+        M = zeros(nq,nq,T,N,Jt);
+        
+        for i = 1:N
+            % Inititalizing
+            P_ks(:,:,end,i) = P_kp(:,:,end,i); P_ks(:,:,end-1,i) = P_kf(:,:,end,i);
+            for t = T-1:-1:1
+                J(:,:,t,i) = P_kf(:,:,t,i)*A'/P_kp(:,:,t+1,i);
+                P_ks(:,:,t,i) = P_kf(:,:,t,i) + J(:,:,t,i)*(P_ks(:,:,t+1,i)-P_kp(:,:,t+1,i))*J(:,:,t,i)';
+            end
+            for j=1:Jt
+                q_ks(:,end,i,j) = q_kp(:,end,i,j); q_ks(:,end-1,i,j) = q_kf(:,end,i,j);
+                for t = T-1:-1:1
+                    q_ks(:,t,i,j) = q_kf(:,t,i,j)+J(:,:,t,i,j)*(q_ks(:,t+1,i,j)-q_kp(:,t+1,i,j));
+                end
+            end
+            % Computing of M = P_{t-1,t|T}
+            tmp_ = [G_pf(:,:,T,i) repmat(zeros(size(G_pf(:,:,T,i))), 1, p-1)];
+            M(:,:,end,i) = (eye(nq)-Kf(:,:,i)*tmp_)*A*P_kf(:,:,T-1,i);
+            
+            for t = T-1:-1:2
+                M(:,:,t,i) = P_kf(:,:,t,i)*J(:,:,t-1,i)' + J(:,:,t,i)*(M(:,:,t+1,i)-A*P_kf(:,:,t,i))*J(:,:,t-1,i)';
+            end
+        end
+        
+    end
+
+    star = logical(mnrnd(1,w(:,end)));
+    r_prime = squeeze(r_pf(:,:,star));
+    ind_prime = squeeze(ind_pf(:,:,star));
+    G_prime = squeeze(G_pf(:,:,:,star));
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%M-STEP%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    %%%%%%MAP ESTIMATE of TIME-VARYING A and ML estimate of V_q%%%%%%%%%%%%%%%%
+    
+    LLT=0;
+    LLTopt=0;
+    S3T = zeros(3*nq+ny,3*nq+ny);
+    
+    
+    % compute sufficient stats    
+    w_ = permute(repmat(w(:,end), [1 3*nq+ny 3*nq+ny 1]), [2 3 1]);
+    w_1= squeeze(w_(:,1,:));
+    Y_ = repmat(Y,[1 1 N]);
+    for t=2:T
+        Bt = compute_Bt(P_ks(:,:,t,:), P_ks(:,:,t-1,:), M(:,:,t,:), nq, ny, N);
+        Bt_s = sum(w_.*Bt, 3);
+        
+        S3T = suff_stats_fast(S3T, q_ks(:,t,:), q_ks(:,t-1,:), Y_(:,t,:), Bt_s, N, nq, ny, w_1);
+    end
+    
+    S3 = (1-gamma(k)).*S3 + gamma(k).*S3T;
+
+    
+    
+    Phi     = S3(1:nq,1:nq);
+    Psi     = S3(1:nq,nq+(1:nq));
+    Sigma   = S3(nq+(1:nq),nq+(1:nq));
+    Xi_1      = S3(2*nq+ny+(1:nq),2*nq+ny+(1:nq));
+    Lambda_1  = S3(2*nq+(1:ny),2*nq+ny+(1:nq));
+    Omega_1   = S3(2*nq+(1:ny),2*nq+(1:ny));
+    G_s = mean(squeeze(mean(G_pf, 4)),3);
+
+   
+    
+    stats.Phi = Phi(1:num_sources, 1:num_sources);
+    stats.Psi = Psi(1:num_sources, 1:nq);
+    stats.Sigma = Sigma;
+    stats.Xi = Xi_1(1:num_sources,1:num_sources);
+    stats.Lambda = Lambda_1(:,1:num_sources);
+    stats.Omega = Omega_1;
+    
+    %compute complete likelihood before optimization
+    LLT = LLT +  compute_complete_ll(T, stats, V_q(1:num_sources, 1:num_sources), A(1:num_sources,1:nq), XI, G_s(:,1:num_sources));
+    
+    %estimate V_q
+    V_q = (Phi - (Psi/Sigma)*Psi')/T;
+    V_q(num_sources+1:num_sources*p, 1:num_sources)=0;
+    V_q(1:num_sources*p, num_sources+1:end)=0;
+    V_q(1:num_sources, 1:num_sources)=V_q(1:num_sources, 1:num_sources).*eye(num_sources);
+    
+    % estimate A
+    tmp = Psi/Sigma;
+    A  = tmp(:,1:nq);
+    A(num_sources+1:num_sources*p, 1:num_sources*(p-1)) = eye(num_sources*(p-1));
+    A(num_sources+1:num_sources*p, 1+num_sources*(p-1):end) = zeros(num_sources*(p-1), num_sources);
+    
+    %estimate XI
+    XI = (Omega_1 - Lambda_1(:,1:num_sources)*G_s' - G_s*Lambda_1(:,1:num_sources)' + G_s*Xi_1(1:num_sources,1:num_sources)*G_s')./(T);
+    XI = XI.*eye(size(XI,1));
+    
+    %compute complete likelihood after optimization
+    LLTopt = LLTopt +  compute_complete_ll(T, stats, V_q(1:num_sources, 1:num_sources), A(1:num_sources,1:nq), XI, G_s(:,1:num_sources));
+    
+    %store the histories of estimated parameters
+    A_hist(:,:,k+1) = A;
+    V_q_hist(:,:,k+1) = V_q;
+    XI_hist(:,:,k+1) = XI;
+    display(['Iteration ',num2str(k),'. Increase in LL: ', num2str(LLTopt - LLT)])
+    toc
+end
+
+for t=1:1:T
+    res.rhat(:,t) = sum(repmat(w(:,end),...
+        1,3*num_sources) .* ...
+        squeeze(r_pf(:,t,:))');
+end
+
+res.qhat = mean(squeeze(mean(q_ks,4)),3);
+q_kf = reshape(q_kf,  nq, T, N, Jt);
+q_kf_hat = mean(squeeze(mean(q_kf,4)),3);
+
+
+end

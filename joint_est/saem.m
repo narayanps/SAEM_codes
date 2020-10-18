@@ -1,0 +1,484 @@
+function [state, params, LL_complete]= saem(init, model, opt_params, Y_avg, Y, Ns, Np, P, dist_thr, gpu_flag, whiten_flag,roi_flag, truth)
+%AUTHOR : NARAYAN SUBRAMANIYAM /AALTO/NBE/
+% INPUTS
+% 1) init : struct containing initial values for parameters and kalman
+% mean/cov . init.A0, init.V_q0, init.q0, init.P0
+
+% 2) model : struct containing model params
+% model.G : lead-field matrix
+
+%model.XI : measurement noise covariance matrix
+
+%model.V_r : jitter matrix for particles
+
+%model.mesh : mesh details (mesh.p, mesh.e)
+
+%model.incl_vert : list of vertices included in source space. Its dimension
+%should be the same as the no. of columns in lead field
+
+
+
+%model.anat_parc : anatomical parcels (this will be optional in future.
+%Presently this info is used to initialize the particles in different
+%anatomical areas
+
+% 3) Y : MEG data (channels X T)
+
+% 4)  opt_params : struct containing parameters the algorithm depends on
+%opt_params.Ns : no of sources / dipoles
+%opt_params.p : MVAR model order
+%opt_params.N : number of particles
+%opt_params.num_iter : no of iterations
+%opt_params.gamma : forgetting factor for SAEM
+%opt_params.dist_thr : distance threshold (just to make sure initial particles
+%draw are not too close to each other. This can be some value like 2 or 3
+
+
+%%%%%%%%%%%%%%PULL OUT VALUES FROM STRUCTS%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+% source space, lead-field matrix
+G = model.G;
+mesh = model.mesh;
+incl_vert = model.incl_verts; % source points used to calculate lead field
+pnts = mesh.p(incl_vert, :); %xyz of vertices included in source-space
+roi_pnts=model.anat_parc;
+
+%initial parameter values
+A_tilde = init.A0; %AR matrix
+V_tilde = init.V0;
+P_tilde = init.P0;
+q_tilde = init.q0;
+
+if whiten_flag==0
+    sigma_m = init.sigma_m0;
+    sigma_b = init.sigma_b0;
+    %measurement+bio noise cov matrix
+    E = sigma_m^2*eye(size(G,1)) + sigma_b^2*(G*G');
+else
+    E = eye(size(G,1));
+end
+
+
+
+% optimization parameters
+Niter = opt_params.Niter;
+gamma = opt_params.gamma;
+
+
+% set few constants
+Nq = Ns*P;
+Ny = size(Y,1);
+T = size(Y,2);
+Nj=size(Y,3); %no of trials
+Nr=Ns*3;
+CONST = -Ny * 0.5 * log(2*pi);
+
+% initialize sufficient statistics matrix
+S = zeros(3*Nq+Ny, 3*Nq+Ny);
+
+
+
+
+
+% parameter and state histories
+params.A_hist = zeros(Ns, Ns*P, Niter+1);
+params.A_hist(:,:,1) = A_tilde(1:Ns,:);
+params.V_hist(:,:,1) = V_tilde(1:Ns, 1:Ns);
+if whiten_flag==0
+params.sigma_m_hist(1) = sigma_m;
+params.sigma_b_hist(1) = sigma_b;
+end
+state.r_hist = zeros(Nr, T, Niter);
+state.qs_hist = zeros(Ns, T+1, Niter);
+state.qf_hist = zeros(Ns, T, Niter);
+
+
+
+%log-likelihoods
+LL_complete = zeros(Niter,1);
+
+%some variables for gpu
+if gpu_flag ==1
+    look_up = zeros(Nj, Np);
+    for j=1:Nj
+        look_up(j,:) = (j-1)*Np+1 : Np*j;
+    end
+    Y_rep = zeros(Ny, Np, Nj);
+end
+
+
+
+% Random initialization of conditional trajectory
+
+[ind_prime, r_prime, G_prime] =  set_part_traj_noroi...
+ (pnts, G, dist_thr, Ns, T, roi_pnts, roi_flag); %for bbcb_simu
+
+
+for k=1:1:Niter
+    sprintf('iteration no %d', k)
+    tic
+    
+    %Kalman filter variables. We assume Kalman covariance is same across
+    %trials to keep things computationally feasible.
+    
+    q_tilde_kf = single(zeros(Nq,T,Np,Nj));
+    q_tilde_kp = single(zeros(Nq,T,Np,Nj));
+    P_tilde_kf = single(zeros(Nq,Nq,T,Np));
+    P_tilde_kp = single(zeros(Nq,Nq,T,Np));
+    
+    % PMCMC variables
+    r_pf = zeros(Nr,T,Np);
+    ind_pf = zeros(Ns, T, Np);
+    G_pf=zeros(Ny,Ns,T,Np);
+    
+    % weights
+    w = single(zeros(Np,T));
+    log_weights = single(zeros(Np,T));
+    
+    % replace Np-th particle with conditional trajectory
+    r_pf(:,:,end) = r_prime;
+    G_pf(:,:,:,end) = G_prime;
+    ind_pf(:,:,end) = ind_prime;
+    
+    % initialize Kalman filter
+    q_tilde_kp(:,1,:,:) = repmat(q_tilde,[1,1,Np, Nj]);
+    P_tilde_kp(:,:,1,:) = repmat(P_tilde,[1,1,1, Np]);
+    
+    %initialize weights
+    w(:,1) = ones(size(w(:,1)));
+    w(:,1) = w(:,1)./sum(w(:,1));
+    
+    % stats for backward smoothing
+    omega_tr = zeros(Ns, Ns, T-1, Nj);
+    lambda_tr = zeros(Ns, T-1, Nj);
+    
+    
+    % Ancestor indices
+    an_hist = zeros(Np, T);
+    
+    
+    % Compute lambda, omega for conditional trajectory
+    tic
+    for j=1:1:Nj
+        [omega_tr(:,:,:,j), lambda_tr(:,:,j)] = compute_omega_lambda_fast...
+            (A_tilde(1:Ns,1:Ns), V_tilde, G_pf, squeeze(Y(:,:,j)), E, Ns, P, Np, T);
+    end
+    toc
+    omega_avg=squeeze(mean(omega_tr,4));
+    lambda_avg=squeeze(mean(lambda_tr,3));
+    
+    % draw particles for t=1
+    [ind_pf(:,1,1:end-1), r_pf(:,1,1:end-1), G_pf(:,:,1,1:end-1)] = ...
+    set_all_part_traj_noroi(pnts, G, dist_thr, Ns, Np-1,roi_pnts,...
+    roi_flag); 
+    
+    
+    % stochastic E-STEP
+    for t=1:T
+        
+        if t >=2
+            [a,~] = find(mnrnd(1,repmat(w(:,t-1)',Np-1,1))');
+            [ind_pf(:,t,1:end-1), XI] = LW_model(squeeze(r_pf(:,t-1,a)), 0.99, pnts);
+            log_det = 2*sum(log(diag(chol(XI))));
+            
+            for i=1:1:Ns
+                r_pf(3*(i-1)+1:3*i,t,1:end-1) = pnts(ind_pf(i,t,1:end-1),:)';
+            end
+            
+            for i=1:1:Np-1
+                G_pf(:,:,t,i) = G(:,squeeze(ind_pf(:,t,i)));
+            end
+            q_tilde_kf_mean = squeeze(mean(q_tilde_kf(1:Ns,t-1,:,:),4));
+            P_tilde_kf_mean = squeeze(P_tilde_kf(1:Ns,1:Ns,t-1,:))./Nj;
+            if gpu_flag == 1
+                [aN] = compute_aN_gpu(repmat(r_pf(:,t,end), [1 1 Np]), r_pf(:,t-1,:),  q_tilde_kf_mean,  P_tilde_kf_mean, XI, omega_avg(1:Ns,1:Ns,t-1), lambda_avg(1:Ns,t-1),...
+                    w(:,t-1), Np,  CONST, log_det);
+            else
+                [aN] = compute_aN_fast(repmat(r_pf(:,t,end), [1 1 Np]), r_pf(:,t-1,:),  q_tilde_kf_mean,  P_tilde_kf_mean, XI, omega_avg(:,:,t-1), lambda_avg(:,t-1),...
+                    Ns, w(:,t-1), Np,  CONST, log_det);
+            end
+            an_hist(:,t) = [a;aN];
+        end
+        
+        if gpu_flag == 1 % perform kalman predict, update and log-likelihood computation on GPU
+             G_tilde = squeeze(G_pf(:,:,t,:));
+            for j=1:Nj
+                Y_rep(:,:,j) = repmat(squeeze(Y(:,t,j)), [1, 1, Np]);
+            end
+            Y_reshape = reshape(Y_rep, Ny, Np*Nj);
+            
+            %kalman predict(GPU)
+            if t >= 2
+             %   tic
+                q_tilde_kf_ = reshape(squeeze(q_tilde_kf (:,t-1,:,:)), Nq, Np*Nj);
+                [q_tilde_kp_, P_tilde_kp(:,:,t,:)] = gpu_kalman_predict(q_tilde_kf_, squeeze(P_tilde_kf(:,:,t-1,:)), A_tilde, V_tilde);
+                q_tilde_kp (:,t,:,:) = reshape(q_tilde_kp_, Nq, Np, Nj);
+            %    toc
+            end
+            
+            % kalman update(GPU)
+            %tic
+            q_tilde_kp_ = reshape(squeeze(q_tilde_kp(:,t,:,:)), Nq, Np*Nj);
+            q_tilde_kp_gpu = gpuArray(q_tilde_kp_);
+            P_tilde_kp_gpu = gpuArray(squeeze(P_tilde_kp(:,:,t,:)));
+            Y_gpu = gpuArray(Y_reshape);
+            
+            G_tilde_ = repmat(G_tilde, [1 1 1 Nj]);
+            G_tilde_=reshape(G_tilde_, Ny,Ns,Np*Nj);
+            G_tilde_gpu = gpuArray(G_tilde);
+            G_tilde_gpu_ = gpuArray(G_tilde_);
+            E_gpu = gpuArray(E);
+            [q_tilde_kf_, P_tilde_kf(:,:,t,:), Kf_] = gpu_kalman_update(q_tilde_kp_gpu, P_tilde_kp_gpu, Y_gpu, G_tilde_gpu, G_tilde_gpu_, E_gpu, Np, Nj);
+            q_tilde_kf(:,t,:,:) = reshape(q_tilde_kf_, Nq, Np, Nj);
+            %toc
+            for i=1:Np
+                tmp_G_tilde = squeeze(G_tilde(:,:,i));
+                ypred(:,i) = tmp_G_tilde*mean(q_tilde_kp_(1:Ns, look_up(:,i)),2);
+                sigma(:,:,i) = (tmp_G_tilde*squeeze(P_tilde_kp (1:Ns,1:Ns,t,i))*tmp_G_tilde' + E )./Nj;
+                log_det_sigma(i) = 2*sum(log(diag(chol(squeeze(sigma(:,:,i))))));
+            end
+            %tic
+            log_weights(:,t) = gpu_logpdf(Y_avg(:,t),ypred,sigma, log_det_sigma,Np,Ny);
+            %toc
+        else
+            for i = 1:Np
+                for j=1:1:Nj
+                    % Prediction
+                    if t >= 2
+                         [q_tilde_kp(:,t,i,j), P_tilde_kp(:,:,t,i)] = kalman_predict(q_tilde_kf(:,t-1,i,j), P_tilde_kf(:,:,t-1,i), A_tilde, V_tilde );
+                          
+                    end
+                    
+                    % Update
+                    tmp_G_tilde = [G_pf(:,:,t,i) repmat(zeros(size(G_pf(:,:,t,i))), 1, P-1)];
+                    [q_tilde_kf(:,t,i,j), P_tilde_kf(:,:,t,i), Kf(:,:,i)] = kalman_update(q_tilde_kp(:,t,i,j), P_tilde_kp(:,:,t,i), squeeze(Y(:,t,j)),tmp_G_tilde, E);
+                    
+                end
+                % log-likelihood
+                ypred(:,i) = tmp_G_tilde*squeeze(mean(q_tilde_kp(:,t,i,:),4));
+                sigma(:,:,i) = (tmp_G_tilde*P_tilde_kp(:,:,t,i)*tmp_G_tilde' + E )./Nj;
+                log_weights(i,t)=logpdf(Y_avg(:,t), ypred(:,i), sigma(:,:,i));
+            end
+        end
+        
+        % PF weight update
+        maxlog = max(log_weights(:,t));
+        log_weights(:,t) = log_weights(:,t) - maxlog;
+        w(:,t) = exp(log_weights(:,t));
+        w(:,t) = w(:,t) / sum(w(:,t));
+    end
+    
+    % set trajectories based on ancestral history
+    ind_an = an_hist(:,T);
+    for t = T-1:-1:1
+        r_pf(:,t,:) = r_pf(:,t,ind_an);
+        q_tilde_kp(:,t,:,:) = q_tilde_kp(:,t,ind_an,:);
+        P_tilde_kp(:,:,t,:) = P_tilde_kp(:,:,t,ind_an);
+        q_tilde_kf(:,t,:,:) = q_tilde_kf(:,t,ind_an,:);
+        P_tilde_kf(:,:,t,:) = P_tilde_kf(:,:,t,ind_an);
+        G_pf(:,:,t,:) = G_pf(:,:,t,ind_an);
+        ind_an = an_hist(ind_an,t);
+    end
+    
+    
+    
+    
+    if gpu_flag==1
+        q_tilde_ks = zeros(Nq,T+1,Np*Nj); P_tilde_ks = zeros(Nq,Nq,T+1,Np);
+        M = zeros(Nq,Nq,T,Np);
+        
+        q_tilde_kp = reshape(q_tilde_kp, Nq, T, Np*Nj);
+        q_tilde_kf = reshape(q_tilde_kf, Nq, T, Np*Nj);
+        
+        P_tilde_ks(:,:,end,:) = squeeze(P_tilde_kp(:,:,end,:)); P_tilde_ks(:,:,end-1,:) = squeeze(P_tilde_kf(:,:,end,:));
+        q_tilde_ks(:,end,:) = squeeze(q_tilde_kp(:,end,:)); q_tilde_ks(:,end-1,:) = squeeze(q_tilde_kf(:,end,:));
+        
+        P_tilde_ks_t1 = squeeze(P_tilde_ks(:,:,end-1,:));
+        
+        q_tilde_ks_t1 = squeeze( q_tilde_ks(:,end-1,:));
+        
+        
+        
+        for t = T-1:-1:1
+            P_tilde_kf_t = squeeze(P_tilde_kf(:,:,t,:));
+            P_tilde_kp_t1 = squeeze(P_tilde_kp(:,:,t+1,:));
+            q_tilde_kf_t = squeeze(q_tilde_kf(:,t,:));
+            q_tilde_kp_t1 = squeeze(q_tilde_kp(:,t+1,:));
+            [J(:,:,t,:), q_tilde_ks(:,t,:), P_tilde_ks(:,:,t,:)] ...
+                = gpu_kalman_smoother(P_tilde_kf_t, P_tilde_kp_t1, q_tilde_kf_t,q_tilde_kp_t1, ...
+                q_tilde_ks_t1, P_tilde_ks_t1, A_tilde, Np, Nj);
+            P_tilde_ks_t1 = squeeze(P_tilde_ks(:,:,t,:));
+            q_tilde_ks_t1 = squeeze( q_tilde_ks(:,t,:));
+        end
+        
+        
+        
+        % Computing of P_{t-1,t|T}
+        G_T = [G_pf(:,:,T,:) repmat(zeros(size(G_pf(:,:,T,:))), 1, P-1)];
+        G_T=squeeze(G_T);
+        I=eye(Nq);
+        M(:,:,end,:) = gpu_init_M(I, squeeze(Kf_(:,:,:)), G_T, squeeze(P_tilde_kf(:,:,T-1,:)), A_tilde);
+        for t=T-1:-1:2
+            P_tilde_kf_t = squeeze(P_tilde_kf(:,:,t,:));
+            M_tp1 = squeeze(M(:,:,t+1,:));
+            J_tm1 = squeeze(J(:,:,t-1,:));
+            J_t = squeeze(J(:,:,t,:));
+            M(:,:,t,:)  = gpu_one_lag(A_tilde, P_tilde_kf_t, J_tm1, M_tp1, J_t);
+        end
+        q_tilde_ks = reshape(q_tilde_ks,  Nq, T+1, Np, Nj);
+        q_tilde_kf = reshape(q_tilde_kf,  Nq, T, Np, Nj);
+    else
+        q_tilde_ks = zeros(Nq,T+1,Np,Nj); P_tilde_ks = zeros(Nq,Nq,T+1,Np);
+        M = zeros(Nq,Nq,T,Np);
+        
+        for i = 1:Np
+            % Inititalizing
+            P_tilde_ks(:,:,end,i) = P_tilde_kp(:,:,end,i); P_tilde_ks(:,:,end-1,i) = P_tilde_kf(:,:,end,i);
+            for t = T-1:-1:1
+                J(:,:,t,i) = P_tilde_kf(:,:,t,i)*A_tilde'/P_tilde_kp(:,:,t+1,i);
+                P_tilde_ks(:,:,t,i) = P_tilde_kf(:,:,t,i) + J(:,:,t,i)*(P_tilde_ks(:,:,t+1,i)-P_tilde_kp(:,:,t+1,i))*J(:,:,t,i)';
+            end
+            for j=1:Nj
+                q_tilde_ks(:,end,i,j) = q_tilde_kp(:,end,i,j); q_tilde_ks(:,end-1,i,j) = q_tilde_kf(:,end,i,j);
+                for t = T-1:-1:1
+                    q_tilde_ks(:,t,i,j) = q_tilde_kf(:,t,i,j)+J(:,:,t,i)*(q_tilde_ks(:,t+1,i,j)-q_tilde_kp(:,t+1,i,j));
+                end
+            end
+            % Computing of M = P_{t-1,t|T}
+            tmp_ = [G_pf(:,:,T,i) repmat(zeros(size(G_pf(:,:,T,i))), 1, P-1)];
+            M(:,:,end,i) = (eye(Nq)-Kf(:,:,i)*tmp_)*A_tilde*P_tilde_kf(:,:,T-1,i);
+            
+            for t = T-1:-1:2
+                M(:,:,t,i) = P_tilde_kf(:,:,t,i)*J(:,:,t-1,i)' + J(:,:,t,i)*(M(:,:,t+1,i)-A_tilde*P_tilde_kf(:,:,t,i))*J(:,:,t-1,i)';
+            end
+        end
+        
+    end
+    
+    star = logical(mnrnd(1,w(:,end)));
+    r_prime = squeeze(r_pf(:,:,star));
+    ind_prime = squeeze(ind_pf(:,:,star));
+    G_prime = squeeze(G_pf(:,:,:,star));
+    
+    
+    % M-STEP
+    %Bt_s = zeros(3*Nq+Ny,3*Nq+Ny, T-1);
+
+    
+    % compute sufficient stats
+    
+   S3T = zeros(3*Nq+Ny,3*Nq+Ny);
+    
+    
+  % compute sufficient stats
+   Y_tmp = repmat(Y,[1 1 1 Np]);
+   
+    for t=2:T
+        w_ = permute(repmat(w(:,t), [1 3*Nq+Ny 3*Nq+Ny 1]), [2 3 1]);
+        w_1= squeeze(w_(:,1,:));
+        Bt = compute_Bt(P_tilde_ks(:,:,t,:), P_tilde_ks(:,:,t-1,:), M(:,:,t,:), Nq, Ny, Np);
+        Bt_s = sum(w_.*Bt, 3);
+        for j=1:1:Nj
+            S3T = suff_stats_fast(S3T, q_tilde_ks(:,t,:,j), q_tilde_ks(:,t-1,:,j), squeeze(Y_tmp(:,t,j,:)), Bt_s, Np, Nq, Ny, w_1);
+        end
+    end
+
+    S = (1-gamma(k)).*S + gamma(k).*S3T;    
+    Phi     = S(1:Nq,1:Nq);
+    Psi     = S(1:Nq,Nq+(1:Nq));
+    Sigma   = S(Nq+(1:Nq),Nq+(1:Nq));
+    Xi_1      = S(2*Nq+Ny+(1:Nq),2*Nq+Ny+(1:Nq));
+    Lambda_1  = S(2*Nq+(1:Ny),2*Nq+Ny+(1:Nq));
+    Omega_1   = S(2*Nq+(1:Ny),2*Nq+(1:Ny));
+    G_s = mean(squeeze(mean(G_pf, 4)),3);
+    
+    
+    
+    stats.Phi = Phi(1:Ns, 1:Ns);
+    stats.Psi = Psi(1:Ns, 1:Nq);
+    stats.Sigma = Sigma;
+    stats.Xi = Xi_1(1:Ns,1:Ns);
+    stats.Lambda = Lambda_1(:,1:Ns);
+    stats.Omega = Omega_1;
+    
+    %compute complete likelihood before optimization
+    LLT =  compute_complete_ll(Nj*T, stats, V_tilde(1:Ns, 1:Ns), A_tilde(1:Ns,1:Nq), E, G_s(:,1:Ns));
+    
+    %estimate V_q
+    V_tilde = (Phi - (Psi/Sigma)*Psi')/(Nj*T);
+    V_tilde(Ns+1:Ns*P, 1:Ns)=0;
+    V_tilde(1:Ns*P, Ns+1:end)=0;
+    V_tilde(1:Ns, 1:Ns)=V_tilde(1:Ns, 1:Ns).*eye(Ns);
+    
+    % check  if V_q is SPD
+    V_tilde(1:Ns, 1:Ns) = max(V_tilde(1:Ns, 1:Ns),1e-4);
+    if min(eig(V_tilde(1:Ns, 1:Ns)))< 0
+        V_tilde(1:Ns, 1:Ns) = V_tilde(1:Ns, 1:Ns) + 0.001*eye(Ns);
+    end
+    V_tilde(1:Ns, 1:Ns)
+    %estimate source amplitudes
+    q_ks_hat = mean(squeeze(mean(q_tilde_ks,4)),3);
+    q_kf_hat = mean(squeeze(mean(q_tilde_kf,4)),3);
+    
+    % estimate A
+    tmp = Psi/Sigma;
+    A_tilde  = tmp(:,1:Nq);
+    A_tilde(Ns+1:Ns*P, 1:Ns*(P-1)) = eye(Ns*(P-1));
+    A_tilde(Ns+1:Ns*P, 1+Ns*(P-1):end) = zeros(Ns*(P-1), Ns);
+    
+    
+    %estimate E
+    if whiten_flag == 0
+        S_R = Omega_1 - Lambda_1(:,1:Ns)*G_s' - G_s*Lambda_1(:,1:Ns)' + G_s*Xi_1(1:Ns,1:Ns)*G_s';
+        sigma_m = grad_descent_sigmam(S_R, G, Nj*T, sigma_b, sigma_m);
+        sigma_b = grad_descent_sigmab(S_R, G, Nj*T, sigma_b, sigma_m);
+        E = sigma_m^2*eye(size(G,1)) + sigma_b^2*(G*G');
+        % check  if E is SPD
+        [V_,D_] = eig(E);
+        [I_,J_] = find(D_<0);
+        
+        if (~isempty(I_))
+            for ii = 1:length(I_)
+                D_(I_(ii),J_(ii)) = 1e-11;
+            end
+            E = V_*D_*V_';
+        end
+        
+        
+    end
+       
+    %compute complete likelihood after optimization
+    LLTopt =  compute_complete_ll(Nj*T, stats, V_tilde(1:Ns, 1:Ns), A_tilde(1:Ns,1:Nq), E, G_s(:,1:Ns));
+    
+    %store the histories of estimated parameters
+    params.A_hist(:,:,k+1) = A_tilde(1:Ns,:);
+    params.V_hist(:,:,k+1) = V_tilde(1:Ns, 1:Ns);
+    if whiten_flag==0
+        params.sigma_b_hist(1,k+1) = sigma_b;
+        params.sigma_m_hist(1,k+1) = sigma_m;
+    end
+    display(['Iteration ',num2str(k),'. Increase in LL: ', num2str(LLTopt - LLT)])
+    LL_complete(k,1) = LLTopt;
+    
+    
+    % compute posterior means from PMCMC and Kalman filter
+    r_pf_hat = zeros(Nr, T);
+    for t=1:1:T
+        r_pf_hat(:,t) = sum(repmat(w(:,t),...
+            1,3*Ns) .* ...
+            squeeze(r_pf(:,t,:))');
+    end
+    
+    
+    
+    state.r_hist(:,:,k) = r_pf_hat;
+    state.r_particles = r_pf;
+    state.qs_hist(:,:,k) = q_ks_hat(1:Ns,:);
+    state.qs_trials = squeeze(mean(q_tilde_ks(1:Ns,:,:,:),3));
+    state.qf_hist(:,:,k) = q_kf_hat(1:Ns,:);
+    toc
+end
+end
+
+
