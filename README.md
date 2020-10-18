@@ -1,2 +1,4 @@
 # SAEM_codes
-# make a data folder in bbcb_simu and download data from http://bbci.de/supplementary/EEGconnectivity/BBCB.html sa.mat and miscdata.mat to generate simulations
+# make a data folder in bbcb_simu and download the following files from http://bbci.de/supplementary/EEGconnectivity/BBCB.html 
+# 1. sa.mat
+# 2. miscdata.mat 
